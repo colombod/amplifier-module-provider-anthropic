@@ -37,7 +37,8 @@ class FakeCoordinator:
 
 def test_tool_call_sequence_missing_tool_message_is_repaired():
     """Missing tool results should be repaired with synthetic results and emit event."""
-    provider = AnthropicProvider(api_key="test-key")
+    # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
+    provider = AnthropicProvider(api_key="test-key", config={"use_streaming": False})
     provider.client.messages.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -78,7 +79,8 @@ def test_repaired_tool_ids_are_not_detected_again():
 
     The fix tracks repaired tool IDs to skip re-detection.
     """
-    provider = AnthropicProvider(api_key="test-key")
+    # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
+    provider = AnthropicProvider(api_key="test-key", config={"use_streaming": False})
     provider.client.messages.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
@@ -124,7 +126,8 @@ def test_repaired_tool_ids_are_not_detected_again():
 
 def test_multiple_missing_tool_results_all_tracked():
     """Multiple missing tool results should all be tracked to prevent infinite loops."""
-    provider = AnthropicProvider(api_key="test-key")
+    # use_streaming=False so we use messages.create (which we mock) instead of messages.stream
+    provider = AnthropicProvider(api_key="test-key", config={"use_streaming": False})
     provider.client.messages.create = AsyncMock(return_value=DummyResponse())
     fake_coordinator = FakeCoordinator()
     provider.coordinator = cast(ModuleCoordinator, fake_coordinator)
