@@ -42,6 +42,18 @@ from amplifier_core.llm_errors import (
 from amplifier_core.llm_errors import RateLimitError as KernelRateLimitError
 from amplifier_core.utils import truncate_values
 from amplifier_core.utils.retry import RetryConfig, retry_with_backoff
+from amplifier_core.message_models import ChatRequest
+from amplifier_core.message_models import ChatResponse
+from amplifier_core.message_models import Message
+from amplifier_core.message_models import ToolCall
+from anthropic import APIStatusError as AnthropicAPIStatusError
+from anthropic import AsyncAnthropic
+from anthropic import AuthenticationError as AnthropicAuthenticationError
+from anthropic import BadRequestError as AnthropicBadRequestError
+from anthropic import RateLimitError as AnthropicRateLimitError
+from anthropic._exceptions import (
+    OverloadedError as AnthropicOverloadedError,
+)  # Not exported in public API as of SDK v0.75.0
 
 
 @dataclass
@@ -139,16 +151,6 @@ class _RateLimitState:
 
         return best_ratio, best_dimension, best_remaining, best_limit, best_reset
 
-
-from amplifier_core.message_models import ChatRequest
-from amplifier_core.message_models import ChatResponse
-from amplifier_core.message_models import Message
-from amplifier_core.message_models import ToolCall
-from anthropic import APIStatusError as AnthropicAPIStatusError
-from anthropic import AsyncAnthropic
-from anthropic import AuthenticationError as AnthropicAuthenticationError
-from anthropic import BadRequestError as AnthropicBadRequestError
-from anthropic import RateLimitError as AnthropicRateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +295,9 @@ class AnthropicProvider:
             min_delay=float(self.config.get("min_retry_delay", 1.0)),
             max_delay=float(self.config.get("max_retry_delay", 60.0)),
             jitter=float(jitter_val),
+        )
+        self._overloaded_delay_multiplier = float(
+            self.config.get("overloaded_delay_multiplier", 10.0)
         )
 
         # Pre-emptive throttle configuration
@@ -585,9 +590,12 @@ class AnthropicProvider:
 
         Delegates to shared utility from amplifier_core.utils.
         """
-        if max_length is None:
-            max_length = self.debug_truncate_length
-        return truncate_values(obj, max_length)
+        length: int = (
+            max_length
+            if max_length is not None
+            else (self.debug_truncate_length or 180)
+        )
+        return truncate_values(obj, length)
 
     def _find_missing_tool_results(
         self, messages: list[Message]
@@ -984,11 +992,8 @@ class AnthropicProvider:
 
         thinking_budget = None
         interleaved_thinking_enabled = False
+        request_caps = self._get_capabilities(params["model"])
         if thinking_enabled:
-            # Resolve capabilities for the actual model in this request
-            # (may differ from instance default when callers pass model=...).
-            request_caps = self._get_capabilities(params["model"])
-
             # Guard: skip thinking entirely for models that don't support it
             # (e.g. Haiku). Without this check we would send budget_tokens=0
             # which violates the API's >= 1024 minimum.
@@ -1242,6 +1247,27 @@ class AnthropicProvider:
                         model=params["model"],
                         status_code=getattr(e, "status_code", 400),
                     ) from e
+
+            except AnthropicOverloadedError as e:
+                body = getattr(e, "body", None)
+                error_msg = json.dumps(body) if body is not None else str(e)
+                retry_after: float | None = None
+                if hasattr(e, "response") and e.response:
+                    raw = e.response.headers.get("retry-after")
+                    if raw is not None:
+                        try:
+                            retry_after = float(raw)
+                        except (ValueError, TypeError):
+                            pass
+                raise KernelProviderUnavailableError(
+                    error_msg,
+                    provider="anthropic",
+                    model=params["model"],
+                    status_code=529,
+                    retryable=True,
+                    retry_after=retry_after,
+                    delay_multiplier=self._overloaded_delay_multiplier,
+                ) from e
 
             except AnthropicAPIStatusError as e:
                 status = getattr(e, "status_code", 500)
