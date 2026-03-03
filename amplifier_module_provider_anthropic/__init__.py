@@ -154,6 +154,44 @@ class _RateLimitState:
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Process-wide concurrency gate
+# ---------------------------------------------------------------------------
+# Shared across ALL AnthropicProvider instances in this process (including
+# parent + delegated child sessions). Prevents blast patterns that trigger
+# Cloudflare bot detection when many sessions delegate simultaneously.
+# Created lazily on the first API call; keyed by event loop so that tests
+# using asyncio.run() get fresh semaphores rather than inheriting stale state.
+
+_process_semaphore: asyncio.Semaphore | None = None
+_process_semaphore_loop: Any = None  # asyncio.AbstractEventLoop
+_process_semaphore_max: int = 0
+_active_requests: int = 0  # currently holding semaphore (executing)
+_waiting_requests: int = 0  # waiting to acquire semaphore
+
+
+async def _get_process_semaphore(max_concurrent: int) -> asyncio.Semaphore | None:
+    """Get or create the process-wide concurrency semaphore.
+
+    Returns ``None`` when ``max_concurrent <= 0`` (semaphore disabled).
+    Recreates the semaphore when called from a different event loop so that
+    unit tests using ``asyncio.run()`` always get a fresh, valid semaphore.
+    """
+    global _process_semaphore, _process_semaphore_loop, _process_semaphore_max
+    if max_concurrent <= 0:
+        return None
+    current_loop = asyncio.get_running_loop()
+    if (
+        _process_semaphore is None
+        or _process_semaphore_loop is not current_loop
+        or _process_semaphore_max != max_concurrent
+    ):
+        _process_semaphore = asyncio.Semaphore(max_concurrent)
+        _process_semaphore_loop = current_loop
+        _process_semaphore_max = max_concurrent
+    return _process_semaphore
+
+
 # Beta header constants — single source of truth for experimental feature headers
 BETA_HEADER_1M_CONTEXT = "context-1m-2025-08-07"
 BETA_HEADER_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
@@ -304,6 +342,16 @@ class AnthropicProvider:
         self._throttle_delay = float(self.config.get("throttle_delay", 1.0))
         self._rate_limit_state = _RateLimitState()
 
+        # Process-wide concurrency gate.
+        # Limits how many API calls this process has in-flight simultaneously,
+        # shared across ALL provider instances (parent + delegated child sessions).
+        # This prevents blast patterns (e.g. parallel: true recipes spawning 20+
+        # concurrent calls) that trigger Cloudflare bot-detection on api.anthropic.com.
+        # Set to 0 to disable the semaphore entirely.
+        self._max_concurrent_requests = int(
+            self.config.get("max_concurrent_requests", 5)
+        )
+
         # Use streaming API by default to support large context windows (Anthropic requires streaming
         # for operations that may take > 10 minutes, e.g. with 300k+ token contexts)
         self.use_streaming = self.config.get("use_streaming", True)
@@ -349,6 +397,23 @@ class AnthropicProvider:
             beta_header_value = ",".join(self._beta_headers)
             self._default_headers = {"anthropic-beta": beta_header_value}
             logger.info(f"[PROVIDER] Beta headers enabled: {beta_header_value}")
+
+        # Shared rate-limit state file for cross-process awareness.
+        # All Anthropic provider instances (across processes, Docker containers
+        # sharing a filesystem, etc.) read this file before the per-emptive
+        # throttle check and write to it after every successful API response.
+        # This lets process B know that process A is almost out of tokens and
+        # should back off — even though they each have independent _RateLimitState
+        # instances.
+        # Set to "" to disable cross-process sharing entirely.
+        _default_shared_path = os.path.join(
+            os.path.expanduser("~"), ".amplifier", "rate-limit-state.json"
+        )
+        self._shared_state_path: str = str(
+            self.config.get("rate_limit_state_path", _default_shared_path)
+        )
+        self._last_shared_state_read: float = 0.0  # epoch time of last file read
+        self._last_written_state: dict[str, Any] = {}  # last written content (for change detection)
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -552,7 +617,13 @@ class AnthropicProvider:
                 supports_thinking=True,
                 supports_adaptive_thinking=is_46_plus,
                 default_thinking_budget=64000 if is_46_plus else 32000,
-                capability_tags=("tools", "thinking", "streaming", "json_mode", "vision"),
+                capability_tags=(
+                    "tools",
+                    "thinking",
+                    "streaming",
+                    "json_mode",
+                    "vision",
+                ),
             )
 
         if family == "sonnet":
@@ -563,7 +634,13 @@ class AnthropicProvider:
                 supports_thinking=True,
                 supports_adaptive_thinking=False,
                 default_thinking_budget=32000,
-                capability_tags=("tools", "thinking", "streaming", "json_mode", "vision"),
+                capability_tags=(
+                    "tools",
+                    "thinking",
+                    "streaming",
+                    "json_mode",
+                    "vision",
+                ),
             )
 
         if family == "haiku":
@@ -579,6 +656,165 @@ class AnthropicProvider:
 
         # Unknown family — conservative defaults
         return ModelCapabilities(family=family)
+
+    @staticmethod
+    def _is_cloudflare_challenge(error: AnthropicAPIStatusError) -> bool:
+        """Detect Cloudflare bot-management challenge responses.
+
+        Cloudflare interposes HTML challenge pages (HTTP 403) that look nothing
+        like Anthropic API errors.  Signals:
+
+        1. The SDK failed to parse the body as JSON (error.body is None).
+        2. The Content-Type is text/html (not application/json).
+        3. The raw response text contains Cloudflare markers.
+
+        Any combination of (1 + 2) or (1 + 3) is sufficient.  If the SDK
+        successfully parsed a JSON body, this is a real API error regardless
+        of other signals.
+        """
+        # If the SDK parsed a JSON body, this is a real API error
+        if getattr(error, "body", None) is not None:
+            return False
+
+        # Inspect the raw HTTP response for HTML / Cloudflare signals
+        response = getattr(error, "response", None)
+        if response is None:
+            return False
+
+        content_type = getattr(response, "headers", {}).get("content-type", "")
+        if "text/html" in content_type:
+            return True
+
+        # Fallback: scan response text for Cloudflare markers
+        text = getattr(response, "text", "") or ""
+        cf_markers = (
+            "Just a moment",
+            "cf-browser-verification",
+            "cloudflare",
+            "Checking if the site connection is secure",
+        )
+        return any(marker in text for marker in cf_markers)
+
+    def _write_shared_rate_limit_state(self, rate_limit_info: dict[str, Any]) -> None:
+        """Atomically write rate-limit header data to the shared cross-process file.
+
+        Uses write-to-tmp + os.rename() so concurrent readers never see a partial
+        file.  Only writes if the rate-limit data actually changed (debounce by
+        content equality) to avoid excessive I/O on every response.
+
+        Wrapped entirely in try/except — file I/O failures must NEVER crash the
+        provider.  The feature is completely silent when disabled (empty path).
+        """
+        if not self._shared_state_path:
+            return
+        try:
+            _rate_fields = (
+                "requests_remaining",
+                "requests_limit",
+                "requests_reset",
+                "input_tokens_remaining",
+                "input_tokens_limit",
+                "input_tokens_reset",
+                "output_tokens_remaining",
+                "output_tokens_limit",
+                "output_tokens_reset",
+            )
+            # Build the comparable payload (excludes volatile metadata)
+            comparable: dict[str, Any] = {}
+            for fname in _rate_fields:
+                val = rate_limit_info.get(fname)
+                if val is not None:
+                    comparable[fname] = val
+
+            # Skip write if nothing changed (debounce)
+            if comparable == self._last_written_state:
+                return
+
+            state: dict[str, Any] = {
+                "updated_at": time.time(),
+                "updated_by_pid": os.getpid(),
+                **comparable,
+            }
+
+            path = self._shared_state_path
+            tmp_path = path + ".tmp"
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(tmp_path, "w") as f:
+                json.dump(state, f)
+            os.rename(tmp_path, path)
+            self._last_written_state = comparable
+        except Exception:
+            pass  # Never crash on I/O errors
+
+    def _read_shared_rate_limit_state(self) -> None:
+        """Read cross-process rate-limit state and merge it into local state.
+
+        Only re-reads the file at most once per second (simple timestamp cache)
+        to avoid hammering the filesystem on every throttle check.
+
+        Merge strategy for *remaining* fields: take the LOWER value between local
+        and shared state (conservative — don't assume capacity we can't confirm).
+        For *limit* and *reset* fields: adopt the shared value only when local has
+        no data yet.
+
+        Ignores stale data (file older than 120 seconds) since stale rate-limit
+        windows are meaningless.
+
+        Wrapped entirely in try/except — file I/O failures must NEVER crash the
+        provider.
+        """
+        if not self._shared_state_path:
+            return
+        now = time.time()
+        if now - self._last_shared_state_read < 1.0:
+            return  # Cache: don't re-read within 1 second
+        self._last_shared_state_read = now
+        try:
+            with open(self._shared_state_path) as f:
+                data: dict[str, Any] = json.load(f)
+
+            updated_at = data.get("updated_at", 0)
+            if now - updated_at > 120:
+                return  # Stale — ignore
+
+            # Merge remaining values: always take the lower of local vs shared
+            _remaining_fields = (
+                "requests_remaining",
+                "input_tokens_remaining",
+                "output_tokens_remaining",
+            )
+            # Limit / reset fields: adopt shared only when local is absent
+            _limit_reset_fields = (
+                "requests_limit",
+                "requests_reset",
+                "input_tokens_limit",
+                "input_tokens_reset",
+                "output_tokens_limit",
+                "output_tokens_reset",
+            )
+            merged: dict[str, Any] = {}
+            for fname in _remaining_fields:
+                shared_val = data.get(fname)
+                local_val = getattr(self._rate_limit_state, fname)
+                if shared_val is not None and local_val is not None:
+                    merged[fname] = min(int(shared_val), int(local_val))
+                elif shared_val is not None:
+                    merged[fname] = int(shared_val)
+                # else: keep local value (don't override with absent shared data)
+
+            for fname in _limit_reset_fields:
+                shared_val = data.get(fname)
+                local_val = getattr(self._rate_limit_state, fname)
+                if shared_val is not None and local_val is None:
+                    merged[fname] = shared_val
+
+            if merged:
+                self._rate_limit_state.update_from_headers(merged)
+
+        except FileNotFoundError:
+            pass  # Normal: file doesn't exist yet
+        except Exception:
+            pass  # Never crash on I/O errors
 
     def _truncate_values(self, obj: Any, max_length: int | None = None) -> Any:
         """Recursively truncate string values in nested structures.
@@ -1269,6 +1505,36 @@ class AnthropicProvider:
                 body = getattr(e, "body", None)
                 error_msg = json.dumps(body) if body is not None else str(e)
                 if status == 403:
+                    # Distinguish Cloudflare bot challenges (transient) from
+                    # real API 403s (permanent).  Cloudflare returns HTML
+                    # challenge pages that the SDK can't parse as JSON, so
+                    # e.body is None and content-type is text/html.
+                    if self._is_cloudflare_challenge(e):
+                        logger.warning(
+                            "[PROVIDER] Cloudflare challenge detected (HTTP 403 "
+                            "with HTML body). Treating as transient — will retry."
+                        )
+                        if self.coordinator and hasattr(self.coordinator, "hooks"):
+                            await self.coordinator.hooks.emit(
+                                "provider:cloudflare_challenge",
+                                {
+                                    "provider": "anthropic",
+                                    "model": params["model"],
+                                    "active_requests": _active_requests,
+                                    "waiting_requests": _waiting_requests,
+                                    "max_concurrent": self._max_concurrent_requests,
+                                    "process_id": os.getpid(),
+                                    "timestamp": time.time(),
+                                },
+                            )
+                        raise KernelProviderUnavailableError(
+                            "Cloudflare bot challenge (transient 403 with HTML body). "
+                            "This typically resolves on retry.",
+                            provider="anthropic",
+                            model=params["model"],
+                            status_code=403,
+                            retryable=True,
+                        ) from e
                     raise KernelAccessDeniedError(
                         error_msg,
                         provider="anthropic",
@@ -1354,6 +1620,65 @@ class AnthropicProvider:
                     },
                 )
 
+        async def _do_complete_guarded():
+            """Semaphore-gated wrapper around _do_complete with concurrency logging.
+
+            Acquires the process-wide concurrency semaphore before each API call
+            attempt so that at most ``max_concurrent_requests`` calls are in-flight
+            simultaneously across all provider instances in this process.
+
+            This is the function passed to retry_with_backoff so that:
+            - the semaphore is *released* between retry attempts (during backoff sleep)
+            - each fresh attempt must re-acquire before hitting the network
+            """
+            global _active_requests, _waiting_requests
+            sem = await _get_process_semaphore(self._max_concurrent_requests)
+            if sem is not None:
+                _waiting_requests += 1
+                async with sem:
+                    _waiting_requests -= 1
+                    _active_requests += 1
+                    try:
+                        if self.coordinator and hasattr(self.coordinator, "hooks"):
+                            await self.coordinator.hooks.emit(
+                                "provider:concurrency",
+                                {
+                                    "provider": "anthropic",
+                                    "model": params["model"],
+                                    "active_requests": _active_requests,
+                                    "waiting_requests": _waiting_requests,
+                                    "max_concurrent": self._max_concurrent_requests,
+                                    "process_id": os.getpid(),
+                                },
+                            )
+                        return await _do_complete()
+                    finally:
+                        _active_requests -= 1
+            else:
+                # Semaphore disabled (max_concurrent_requests=0) — still log
+                _active_requests += 1
+                try:
+                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                        await self.coordinator.hooks.emit(
+                            "provider:concurrency",
+                            {
+                                "provider": "anthropic",
+                                "model": params["model"],
+                                "active_requests": _active_requests,
+                                "waiting_requests": _waiting_requests,
+                                "max_concurrent": 0,
+                                "process_id": os.getpid(),
+                            },
+                        )
+                    return await _do_complete()
+                finally:
+                    _active_requests -= 1
+
+        # Read shared rate-limit state from cross-process file before the
+        # throttle check so we also account for capacity consumed by sibling
+        # processes on the same API key (e.g. parallel sessions, Docker containers).
+        self._read_shared_rate_limit_state()
+
         # Pre-emptive throttle check: if we're running low on any rate limit
         # dimension, inject a delay and warn the user before hitting a 429.
         if self._throttle_threshold > 0:
@@ -1409,7 +1734,7 @@ class AnthropicProvider:
 
         try:
             response = await retry_with_backoff(
-                _do_complete,
+                _do_complete_guarded,
                 self._retry_config,
                 on_retry=_on_retry,
             )
@@ -1423,6 +1748,9 @@ class AnthropicProvider:
             rate_limit_info = captured_rate_limit_info
             # Update throttle state for next request's pre-emptive check
             self._rate_limit_state.update_from_headers(rate_limit_info)
+            # Write shared state so sibling processes can see current capacity.
+            if rate_limit_info:
+                self._write_shared_rate_limit_state(rate_limit_info)
             if rate_limit_info:
                 tokens_remaining = rate_limit_info.get("tokens_remaining")
                 tokens_limit = rate_limit_info.get("tokens_limit")
