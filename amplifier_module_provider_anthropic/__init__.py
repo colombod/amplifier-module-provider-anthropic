@@ -252,16 +252,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     await coordinator.mount("providers", provider, name="anthropic")
     logger.info("Mounted AnthropicProvider")
 
-    # Return cleanup function
-    # CRITICAL: Check _client directly (not .client property) to avoid triggering
-    # lazy initialization during cleanup. Use asyncio.shield to protect close()
-    # from cancellation during Ctrl+C shutdown.
+    # Return cleanup function that delegates to provider.close().
+    # close() handles lazy-client guard, asyncio.shield, and CancelledError.
     async def cleanup():
-        if provider._client is not None:
-            try:
-                await asyncio.shield(provider._client.close())
-            except asyncio.CancelledError:
-                pass  # Swallow cancellation during cleanup
+        await provider.close()
 
     return cleanup
 
@@ -413,7 +407,9 @@ class AnthropicProvider:
             self.config.get("rate_limit_state_path", _default_shared_path)
         )
         self._last_shared_state_read: float = 0.0  # epoch time of last file read
-        self._last_written_state: dict[str, Any] = {}  # last written content (for change detection)
+        self._last_written_state: dict[
+            str, Any
+        ] = {}  # last written content (for change detection)
 
         # Track tool call IDs that have been repaired with synthetic results.
         # This prevents infinite loops when the same missing tool results are
@@ -2509,3 +2505,11 @@ class AnthropicProvider:
             text=combined_text or None,
             web_search_results=web_search_results if web_search_results else None,
         )
+
+    async def close(self) -> None:
+        """Close the underlying Anthropic client to prevent resource leaks."""
+        if self._client is not None:
+            try:
+                await asyncio.shield(self._client.close())
+            except asyncio.CancelledError:
+                pass
